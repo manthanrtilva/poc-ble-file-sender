@@ -36,6 +36,10 @@ Partial Class DeviceServicesForm
         lblDataToSend = New Label()
         txtCharDetails = New TextBox()
         lblCharDetails = New Label()
+        txtFilePath = New TextBox()
+        btnBrowseFile = New Button()
+        lblFile = New Label()
+        btnSendFile = New Button()
         SuspendLayout()
         '
         'lblDeviceName
@@ -73,7 +77,7 @@ Partial Class DeviceServicesForm
         lstServices.ItemHeight = 15
         lstServices.Location = New Point(12, 105)
         lstServices.Name = "lstServices"
-        lstServices.Size = New Size(380, 364)
+        lstServices.Size = New Size(380, 424)
         lstServices.TabIndex = 3
         '
         'lblServicesTitle
@@ -129,14 +133,14 @@ Partial Class DeviceServicesForm
         txtData.Multiline = True
         txtData.Name = "txtData"
         txtData.PlaceholderText = "Enter hex data (e.g., 48656C6C6F) or text"
-        txtData.Size = New Size(280, 70)
+        txtData.Size = New Size(280, 60)
         txtData.TabIndex = 9
         '
         'btnSend
         '
         btnSend.Location = New Point(696, 355)
         btnSend.Name = "btnSend"
-        btnSend.Size = New Size(94, 70)
+        btnSend.Size = New Size(94, 60)
         btnSend.TabIndex = 10
         btnSend.Text = "Send Data"
         btnSend.UseVisualStyleBackColor = True
@@ -171,11 +175,52 @@ Partial Class DeviceServicesForm
         lblCharDetails.TabIndex = 13
         lblCharDetails.Text = "Characteristic Details"
         '
+        'txtFilePath
+        '
+        txtFilePath.Location = New Point(410, 443)
+        txtFilePath.Name = "txtFilePath"
+        txtFilePath.PlaceholderText = "No file selected"
+        txtFilePath.ReadOnly = True
+        txtFilePath.Size = New Size(280, 23)
+        txtFilePath.TabIndex = 14
+        '
+        'btnBrowseFile
+        '
+        btnBrowseFile.Location = New Point(696, 443)
+        btnBrowseFile.Name = "btnBrowseFile"
+        btnBrowseFile.Size = New Size(94, 23)
+        btnBrowseFile.TabIndex = 15
+        btnBrowseFile.Text = "Browse..."
+        btnBrowseFile.UseVisualStyleBackColor = True
+        '
+        'lblFile
+        '
+        lblFile.AutoSize = True
+        lblFile.Font = New Font("Segoe UI", 9.0F, FontStyle.Bold)
+        lblFile.Location = New Point(410, 425)
+        lblFile.Name = "lblFile"
+        lblFile.Size = New Size(28, 15)
+        lblFile.TabIndex = 16
+        lblFile.Text = "File"
+        '
+        'btnSendFile
+        '
+        btnSendFile.Location = New Point(410, 472)
+        btnSendFile.Name = "btnSendFile"
+        btnSendFile.Size = New Size(380, 35)
+        btnSendFile.TabIndex = 17
+        btnSendFile.Text = "Send File"
+        btnSendFile.UseVisualStyleBackColor = True
+        '
         'DeviceServicesForm
         '
         AutoScaleDimensions = New SizeF(7.0F, 15.0F)
         AutoScaleMode = AutoScaleMode.Font
-        ClientSize = New Size(804, 481)
+        ClientSize = New Size(804, 541)
+        Controls.Add(btnSendFile)
+        Controls.Add(lblFile)
+        Controls.Add(btnBrowseFile)
+        Controls.Add(txtFilePath)
         Controls.Add(lblCharDetails)
         Controls.Add(txtCharDetails)
         Controls.Add(lblDataToSend)
@@ -210,5 +255,9 @@ Partial Class DeviceServicesForm
     Friend WithEvents lblDataToSend As Label
     Friend WithEvents txtCharDetails As TextBox
     Friend WithEvents lblCharDetails As Label
+    Friend WithEvents txtFilePath As TextBox
+    Friend WithEvents btnBrowseFile As Button
+    Friend WithEvents lblFile As Label
+    Friend WithEvents btnSendFile As Button
 
 End Class
