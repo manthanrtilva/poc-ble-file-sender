@@ -189,7 +189,7 @@ Public Class DeviceServicesForm
         If cmbCharacteristics.SelectedIndex < 0 OrElse cmbCharacteristics.SelectedIndex >= characteristicsList.Count Then
             txtCharDetails.Clear()
             btnSend.Enabled = False
-            btnSendFile.Enabled = False
+            ' btnSendFile enabled state is independent of characteristic selection
             Return
         End If
 
@@ -207,7 +207,7 @@ Public Class DeviceServicesForm
                         (characteristic.CharacteristicProperties And GattCharacteristicProperties.WriteWithoutResponse) = GattCharacteristicProperties.WriteWithoutResponse
 
         btnSend.Enabled = isWritable
-        btnSendFile.Enabled = Not String.IsNullOrEmpty(selectedFilePath) ' File send doesn't require characteristic selection
+        ' btnSendFile enabled state is independent of characteristic selection
 
         If Not isWritable Then
             txtCharDetails.Text &= "⚠ This characteristic is not writable"
@@ -368,27 +368,12 @@ Public Class DeviceServicesForm
     End Sub
 
     Private Async Sub btnSendFile_Click(sender As Object, e As EventArgs) Handles btnSendFile.Click
-        If cmbCharacteristics.SelectedIndex < 0 Then
-            MessageBox.Show("Please select a characteristic first.", "No Characteristic", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-            Return
-        End If
-
         If String.IsNullOrEmpty(selectedFilePath) OrElse Not IO.File.Exists(selectedFilePath) Then
             MessageBox.Show("Please select a valid file first.", "No File", MessageBoxButtons.OK, MessageBoxIcon.Warning)
             Return
         End If
 
         Try
-            Dim characteristic = characteristicsList(cmbCharacteristics.SelectedIndex)
-
-            ' Check if writable
-            If Not ((characteristic.CharacteristicProperties And GattCharacteristicProperties.Write) = GattCharacteristicProperties.Write OrElse
-                   (characteristic.CharacteristicProperties And GattCharacteristicProperties.WriteWithoutResponse) = GattCharacteristicProperties.WriteWithoutResponse) Then
-                MessageBox.Show("Selected characteristic is not writable.", "Cannot Write", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-                Return
-            End If
-
-            ' Read file
             Dim fileBytes As Byte() = IO.File.ReadAllBytes(selectedFilePath)
             Dim fileInfo As New IO.FileInfo(selectedFilePath)
 
@@ -399,18 +384,22 @@ Public Class DeviceServicesForm
             Dim crc32Value As UInteger = CalculateCRC32(paddedBytes)
             Dim fileSize As UInteger = CUInt(fileBytes.Length) ' Original file size (not padded)
 
+            ' Build metadata packet using centralized function
+            Dim metadataBytes As Byte() = BuildMetadataPacket(fileSize, crc32Value)
+
             txtCharDetails.Text &= vbCrLf & vbCrLf & $"File: {fileInfo.Name}" & vbCrLf &
                                   $"Size: {fileSize} bytes" & vbCrLf &
                                   $"Padded Size: {paddedBytes.Length} bytes" & vbCrLf &
-                                  $"CRC32: 0x{crc32Value:X8}"
+                                  $"CRC32: 0x{crc32Value:X8}" & vbCrLf &
+                                  $"Metadata Bytes: {BitConverter.ToString(metadataBytes).Replace("-", " ")}"
 
-            ' Find two control characteristics
-            ' Metadata: 11110004-1111-1111-1111-111111111111
-            ' File Data: 11110005-1111-1111-1111-111111111111
-            Dim metadataCharUuid As New Guid("11110004-1111-1111-1111-111111111111")
-            Dim fileDataCharUuid As New Guid("11110005-1111-1111-1111-111111111111")
-            Dim metadataChar As GattCharacteristic = Nothing
-            Dim fileDataChar As GattCharacteristic = Nothing
+            ' Find control characteristic - SINGLE characteristic for both metadata and data
+            ' Pattern: 11110004-1111-1111-1111-111111111111 (opcode-multiplexed: 0x01 for meta, 0x02 for data)
+            ' Also find CC characteristic for MTU negotiation
+            Dim patternCharUuid As New Guid("11110004-1111-1111-1111-111111111111")
+            Dim ccCharUuid As New Guid("11110003-1111-1111-1111-111111111111") ' CC characteristic for MTU
+            Dim patternChar As GattCharacteristic = Nothing
+            Dim ccChar As GattCharacteristic = Nothing
 
             lblCharacteristicsTitle.Text = "Finding control characteristics..."
             Application.DoEvents()
@@ -421,60 +410,79 @@ Public Class DeviceServicesForm
                     Dim charsResult = Await service.GetCharacteristicsAsync(BluetoothCacheMode.Uncached)
                     If charsResult.Status = GattCommunicationStatus.Success Then
                         For Each ch In charsResult.Characteristics
-                            If ch.Uuid = metadataCharUuid Then
-                                metadataChar = ch
-                            ElseIf ch.Uuid = fileDataCharUuid Then
-                                fileDataChar = ch
+                            If ch.Uuid = patternCharUuid Then
+                                patternChar = ch
+                            ElseIf ch.Uuid = ccCharUuid Then
+                                ccChar = ch
                             End If
                         Next
                     End If
-                    If metadataChar IsNot Nothing AndAlso fileDataChar IsNot Nothing Then Exit For
+                    If patternChar IsNot Nothing Then Exit For
                 Catch ex As Exception
                     ' Continue searching
                 End Try
             Next
 
-            If metadataChar Is Nothing Then
-                MessageBox.Show($"Metadata characteristic not found!{vbCrLf}{vbCrLf}UUID: {metadataCharUuid}{vbCrLf}{vbCrLf}Cannot send file.",
-                              "Metadata Characteristic Not Found", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            If patternChar Is Nothing Then
+                MessageBox.Show($"Pattern characteristic not found!{vbCrLf}{vbCrLf}UUID: 11110004-1111-1111-1111-111111111111{vbCrLf}{vbCrLf}Cannot send file.",
+                              "Pattern Characteristic Not Found", MessageBoxButtons.OK, MessageBoxIcon.Error)
                 Return
             End If
 
-            If fileDataChar Is Nothing Then
-                MessageBox.Show($"File data characteristic not found!{vbCrLf}{vbCrLf}UUID: {fileDataCharUuid}{vbCrLf}{vbCrLf}Cannot send file.",
-                              "File Data Characteristic Not Found", MessageBoxButtons.OK, MessageBoxIcon.Error)
-                Return
+            txtCharDetails.Text &= vbCrLf & $"Found pattern characteristic: 11110004"
+
+            ' Negotiate a larger MTU so the file is sent in fewer, bigger chunks.
+            ' The firmware caps the PATTERN value at 247 bytes (see app_ns_ius.c
+            ' NS_IUS_IDX_PATTERN_VAL max length), so request the matching MTU.
+            Const FIRMWARE_MAX_VALUE_LEN As Integer = 247 ' max attribute write length the firmware accepts
+            Const REQUESTED_MTU As Integer = FIRMWARE_MAX_VALUE_LEN + 3 ' + ATT write header
+
+            If ccChar IsNot Nothing Then
+                ' Ask the firmware to start an ATT MTU exchange.
+                ' Command format: [0x02 = OTA_CMD_MTU_UPDATE][MSB of MTU][LSB of MTU]
+                txtCharDetails.Text &= vbCrLf & "Negotiating MTU with device..."
+                Try
+                    Dim mtuRequest(2) As Byte
+                    mtuRequest(0) = &H2 ' OTA_CMD_MTU_UPDATE
+                    mtuRequest(1) = CByte((REQUESTED_MTU >> 8) And &HFF) ' MSB
+                    mtuRequest(2) = CByte(REQUESTED_MTU And &HFF)        ' LSB
+
+                    Dim mtuResult = Await SendDataToCharacteristic(ccChar, mtuRequest)
+                    If mtuResult = GattCommunicationStatus.Success Then
+                        txtCharDetails.Text &= vbCrLf & $"MTU negotiation sent (requested: {REQUESTED_MTU})"
+                    Else
+                        txtCharDetails.Text &= vbCrLf & $"MTU negotiation failed: {mtuResult}"
+                    End If
+                Catch ex As Exception
+                    txtCharDetails.Text &= vbCrLf & $"MTU negotiation error: {ex.Message}"
+                End Try
+                Await Task.Delay(200) ' Give device + stack time to complete the MTU exchange
             End If
 
-            txtCharDetails.Text &= vbCrLf & $"Found metadata characteristic: {metadataCharUuid}"
-            txtCharDetails.Text &= vbCrLf & $"Found file data characteristic: {fileDataCharUuid}"
+            ' Read the ACTUAL negotiated MTU from the GATT session. On Windows the
+            ' OS negotiates the ATT MTU automatically; MaxPduSize reflects it.
+            ' The usable payload per write is MTU - 3 (ATT write header), and the
+            ' firmware caps the value at 247 bytes; reserve 1 byte for the opcode.
+            Dim negotiatedMtu As Integer = 23 ' BLE default ATT MTU
+            Try
+                If gattSession IsNot Nothing AndAlso gattSession.MaxPduSize > 0 Then
+                    negotiatedMtu = gattSession.MaxPduSize
+                End If
+            Catch
+                ' Fall back to default MTU
+            End Try
 
-            ' Send [filesize, crc32] to metadata characteristic (11110004)
+            Dim maxValueLen As Integer = Math.Min(negotiatedMtu - 3, FIRMWARE_MAX_VALUE_LEN)
+            Dim fileChunkSize As Integer = Math.Max(1, maxValueLen - 1) ' minus 1 for opcode byte
+            txtCharDetails.Text &= vbCrLf & $"Negotiated MTU: {negotiatedMtu} → file chunk size: {fileChunkSize} bytes"
+
+            ' Send metadata to pattern characteristic using helper function
+            ' Opcode 0x01 is prepended by BuildMetadataPacket()
             lblCharacteristicsTitle.Text = "Sending file metadata..."
-            txtCharDetails.Text &= vbCrLf & vbCrLf & "Sending metadata to characteristic 11110004..."
+            txtCharDetails.Text &= vbCrLf & vbCrLf & "Sending metadata (opcode 0x01) to pattern characteristic..."
             Application.DoEvents()
 
-            Dim metadataWriter = New Windows.Storage.Streams.DataWriter()
-            metadataWriter.ByteOrder = Windows.Storage.Streams.ByteOrder.LittleEndian
-            metadataWriter.WriteUInt32(fileSize)   ' 4 bytes: file size
-            metadataWriter.WriteUInt32(crc32Value) ' 4 bytes: CRC32
-
-            ' Log metadata bytes
-            Dim metadataBytes(7) As Byte
-            Array.Copy(BitConverter.GetBytes(fileSize), 0, metadataBytes, 0, 4)
-            Array.Copy(BitConverter.GetBytes(crc32Value), 0, metadataBytes, 4, 4)
-            txtCharDetails.Text &= vbCrLf & $"Metadata Bytes: {BitConverter.ToString(metadataBytes).Replace("-", " ")}"
-
-            Dim metadataResult As GattCommunicationStatus
-            Dim metadataBuffer = metadataWriter.DetachBuffer()
-
-            If (metadataChar.CharacteristicProperties And GattCharacteristicProperties.Write) = GattCharacteristicProperties.Write Then
-                metadataResult = Await metadataChar.WriteValueAsync(metadataBuffer, GattWriteOption.WriteWithResponse)
-                txtCharDetails.Text &= vbCrLf & "Metadata Write Mode: WriteWithResponse"
-            Else
-                metadataResult = Await metadataChar.WriteValueAsync(metadataBuffer, GattWriteOption.WriteWithoutResponse)
-                txtCharDetails.Text &= vbCrLf & "Metadata Write Mode: WriteWithoutResponse"
-            End If
+            Dim metadataResult = Await SendDataToCharacteristic(patternChar, metadataBytes)
 
             txtCharDetails.Text &= vbCrLf & $"Metadata Write Status: {metadataResult}"
 
@@ -486,14 +494,14 @@ Public Class DeviceServicesForm
 
             txtCharDetails.Text &= vbCrLf & $"✓ Metadata sent: Size={fileSize}, CRC32=0x{crc32Value:X8}"
 
-            ' Try to read response from metadata characteristic if readable
-            If (metadataChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
+            ' Try to read response from pattern characteristic if readable
+            If (patternChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
                 txtCharDetails.Text &= vbCrLf & "Reading metadata response..."
                 Application.DoEvents()
 
                 Try
                     Await Task.Delay(50) ' Small delay for device to process
-                    Dim readResult = Await metadataChar.ReadValueAsync(BluetoothCacheMode.Uncached)
+                    Dim readResult = Await patternChar.ReadValueAsync(BluetoothCacheMode.Uncached)
 
                     If readResult.Status = GattCommunicationStatus.Success Then
                         Dim reader = Windows.Storage.Streams.DataReader.FromBuffer(readResult.Value)
@@ -502,9 +510,9 @@ Public Class DeviceServicesForm
 
                         txtCharDetails.Text &= vbCrLf & $"Metadata Response: {BitConverter.ToString(responseBytes).Replace("-", " ")}"
 
-                        ' Interpret response if it's a status byte
-                        If responseBytes.Length > 0 Then
-                            txtCharDetails.Text &= vbCrLf & $"Response Value: 0x{responseBytes(0):X2} ({responseBytes(0)})"
+                        ' Interpret response: [opcode, status]
+                        If responseBytes.Length >= 2 Then
+                            txtCharDetails.Text &= vbCrLf & $"Response Opcode: 0x{responseBytes(0):X2}, Status: 0x{responseBytes(1):X2}"
                         End If
                     Else
                         txtCharDetails.Text &= vbCrLf & $"Could not read metadata response: {readResult.Status}"
@@ -518,10 +526,10 @@ Public Class DeviceServicesForm
 
             ' Confirm large file send
             If fileBytes.Length > 512 Then
-                Dim result = MessageBox.Show($"File size is {fileBytes.Length} bytes. This will be sent in chunks." & vbCrLf & vbCrLf &
+                Dim confirmResult = MessageBox.Show($"File size is {fileBytes.Length} bytes. This will be sent in chunks." & vbCrLf & vbCrLf &
                                             "Metadata has been sent. Continue with file transfer?",
                                             "Large File", MessageBoxButtons.YesNo, MessageBoxIcon.Question)
-                If result <> DialogResult.Yes Then
+                If confirmResult <> DialogResult.Yes Then
                     Return
                 End If
             End If
@@ -530,90 +538,25 @@ Public Class DeviceServicesForm
             btnBrowseFile.Enabled = False
             lblCharacteristicsTitle.Text = "Sending file data..."
 
-            ' Get MTU size (typical BLE MTU is 20-512 bytes, we'll use conservative 20)
-            Dim chunkSize As Integer = 20
-            Dim totalChunks As Integer = Math.Ceiling(fileBytes.Length / chunkSize)
-            Dim bytesSent As Integer = 0
-
-            txtCharDetails.Text &= vbCrLf & vbCrLf & $"Sending file data to characteristic 11110005..." & vbCrLf &
-                                  $"Total chunks: {totalChunks}"
-
-            For chunkIndex As Integer = 0 To totalChunks - 1
-                Dim offset As Integer = chunkIndex * chunkSize
-                Dim currentChunkSize As Integer = Math.Min(chunkSize, fileBytes.Length - offset)
-                Dim chunk(currentChunkSize - 1) As Byte
-
-                Array.Copy(fileBytes, offset, chunk, 0, currentChunkSize)
-
-                ' Send chunk to FILE DATA CHARACTERISTIC (11110005)
-                Dim writer = New Windows.Storage.Streams.DataWriter()
-                writer.WriteBytes(chunk)
-
-                Dim writeResult As GattCommunicationStatus
-
-                If (fileDataChar.CharacteristicProperties And GattCharacteristicProperties.Write) = GattCharacteristicProperties.Write Then
-                    writeResult = Await fileDataChar.WriteValueAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse)
-                Else
-                    writeResult = Await fileDataChar.WriteValueAsync(writer.DetachBuffer(), GattWriteOption.WriteWithoutResponse)
-                End If
-
-                If writeResult <> GattCommunicationStatus.Success Then
-                    MessageBox.Show($"Failed to send chunk {chunkIndex + 1}/{totalChunks}: {writeResult}", "Send Failed", MessageBoxButtons.OK, MessageBoxIcon.Error)
-                    txtCharDetails.Text &= vbCrLf & $"✗ Failed at chunk {chunkIndex + 1}/{totalChunks}: {writeResult}"
-                    Return
-                End If
-
-                bytesSent += currentChunkSize
-                Await Task.Delay(10)
-
-                ' Try to read response from file data characteristic after each write
-                'If (fileDataChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
-                '    Try
-                '        Await Task.Delay(10) ' Small delay for device to prepare response
-                '        Dim readResult = Await fileDataChar.ReadValueAsync(BluetoothCacheMode.Uncached)
-
-                '        txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} Read Status: {readResult.Status}"
-
-                '        If readResult.Status = GattCommunicationStatus.Success Then
-                '            Dim reader = Windows.Storage.Streams.DataReader.FromBuffer(readResult.Value)
-                '            txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} Buffer Length: {reader.UnconsumedBufferLength}"
-
-                '            If reader.UnconsumedBufferLength > 0 Then
-                '                Dim responseBytes(reader.UnconsumedBufferLength - 1) As Byte
-                '                reader.ReadBytes(responseBytes)
-
-                '                txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} Response: {BitConverter.ToString(responseBytes).Replace("-", " ")}"
-                '            Else
-                '                txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} Response: (empty buffer)"
-                '            End If
-                '        End If
-                '    Catch ex As Exception
-                '        txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} Read Error: {ex.Message}"
-                '    End Try
-                'Else
-                '    txtCharDetails.Text &= vbCrLf & $"Chunk {chunkIndex + 1}/{totalChunks} - Characteristic not readable"
-                'End If
-
-                lblCharacteristicsTitle.Text = $"Sending... {bytesSent}/{fileBytes.Length} bytes ({chunkIndex + 1}/{totalChunks})"
-                Application.DoEvents()
-
-                ' Small delay between chunks to avoid overwhelming device
-                If (fileDataChar.CharacteristicProperties And GattCharacteristicProperties.Write) <> GattCharacteristicProperties.Write Then
-                    Await Task.Delay(10) ' Delay for WriteWithoutResponse
-                End If
-            Next
+            ' Send file data in chunks using helper function
+            ' Using the SAME pattern characteristic with opcode 0x02
+            ' Chunk size derived from the negotiated MTU above
+            ' Returns tuple of (bytes sent, chunks sent)
+            Dim result = Await SendFileDataInChunks(patternChar, fileBytes, fileChunkSize)
+            Dim totalBytesSent = result.BytesSent
+            Dim totalChunks = result.ChunksSent
 
             lblCharacteristicsTitle.Text = "File Sent Successfully!"
-            txtCharDetails.Text &= vbCrLf & $"✓ Successfully sent {bytesSent} bytes in {totalChunks} chunks"
+            txtCharDetails.Text &= vbCrLf & $"✓ Successfully sent {totalBytesSent} bytes in {totalChunks} chunks"
 
-            ' Try to read final response from metadata characteristic
-            If (metadataChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
-                txtCharDetails.Text &= vbCrLf & vbCrLf & "Reading final response from metadata characteristic..."
+            ' Try to read final response from pattern characteristic
+            If (patternChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
+                txtCharDetails.Text &= vbCrLf & vbCrLf & "Reading final response from pattern characteristic..."
                 Application.DoEvents()
 
                 Try
                     Await Task.Delay(100) ' Wait for device to process
-                    Dim readResult = Await metadataChar.ReadValueAsync(BluetoothCacheMode.Uncached)
+                    Dim readResult = Await patternChar.ReadValueAsync(BluetoothCacheMode.Uncached)
 
                     If readResult.Status = GattCommunicationStatus.Success Then
                         Dim reader = Windows.Storage.Streams.DataReader.FromBuffer(readResult.Value)
@@ -622,8 +565,8 @@ Public Class DeviceServicesForm
 
                         txtCharDetails.Text &= vbCrLf & $"Final Response: {BitConverter.ToString(responseBytes).Replace("-", " ")}"
 
-                        If responseBytes.Length > 0 Then
-                            txtCharDetails.Text &= vbCrLf & $"Response Value: 0x{responseBytes(0):X2} ({responseBytes(0)})"
+                        If responseBytes.Length >= 2 Then
+                            txtCharDetails.Text &= vbCrLf & $"Response Opcode: 0x{responseBytes(0):X2}, Status: 0x{responseBytes(1):X2}"
                         End If
                     End If
                 Catch ex As Exception
@@ -631,7 +574,7 @@ Public Class DeviceServicesForm
                 End Try
             End If
 
-            MessageBox.Show($"File sent successfully!{vbCrLf}{vbCrLf}File: {fileInfo.Name}{vbCrLf}Size: {bytesSent} bytes{vbCrLf}CRC32: 0x{crc32Value:X8}{vbCrLf}Chunks: {totalChunks}{vbCrLf}Metadata: 11110004{vbCrLf}File Data: 11110005",
+            MessageBox.Show($"File sent successfully!{vbCrLf}{vbCrLf}File: {fileInfo.Name}{vbCrLf}Size: {totalBytesSent} bytes{vbCrLf}Chunks: {totalChunks}{vbCrLf}CRC32: 0x{crc32Value:X8}{vbCrLf}Pattern Characteristic: 11110004 (opcode-multiplexed)",
                           "Success", MessageBoxButtons.OK, MessageBoxIcon.Information)
 
         Catch ex As Exception
@@ -747,6 +690,96 @@ Public Class DeviceServicesForm
         Else
             Return "None"
         End If
+    End Function
+
+    ''' <summary>
+    ''' Builds a metadata packet with file size and CRC32 checksum.
+    ''' Current format: [opcode:1 byte = 0x01][size:4 bytes LE][crc32:4 bytes LE]
+    ''' Total: 9 bytes
+    ''' 
+    ''' MODIFY THIS FUNCTION IF FIRMWARE CHANGES THE METADATA FORMAT
+    ''' </summary>
+    Private Function BuildMetadataPacket(fileSize As UInteger, crc32Value As UInteger) As Byte()
+        Dim metadataBytes(8) As Byte ' 9 bytes total
+        metadataBytes(0) = &H1 ' Opcode for metadata
+
+        ' File size in little-endian (4 bytes)
+        metadataBytes(1) = CByte((fileSize >> 0) And &HFF)
+        metadataBytes(2) = CByte((fileSize >> 8) And &HFF)
+        metadataBytes(3) = CByte((fileSize >> 16) And &HFF)
+        metadataBytes(4) = CByte((fileSize >> 24) And &HFF)
+
+        ' CRC32 in little-endian (4 bytes)
+        metadataBytes(5) = CByte((crc32Value >> 0) And &HFF)
+        metadataBytes(6) = CByte((crc32Value >> 8) And &HFF)
+        metadataBytes(7) = CByte((crc32Value >> 16) And &HFF)
+        metadataBytes(8) = CByte((crc32Value >> 24) And &HFF)
+
+        Return metadataBytes
+    End Function
+
+    ''' <summary>
+    ''' Sends data to a characteristic with automatic write mode detection.
+    ''' </summary>
+    Private Async Function SendDataToCharacteristic(characteristic As GattCharacteristic, data As Byte()) As Task(Of GattCommunicationStatus)
+        Dim writer = New Windows.Storage.Streams.DataWriter()
+        writer.WriteBytes(data)
+
+        Dim writeOption As GattWriteOption
+        If (characteristic.CharacteristicProperties And GattCharacteristicProperties.Write) = GattCharacteristicProperties.Write Then
+            writeOption = GattWriteOption.WriteWithResponse
+        Else
+            writeOption = GattWriteOption.WriteWithoutResponse
+        End If
+
+        Return Await characteristic.WriteValueAsync(writer.DetachBuffer(), writeOption)
+    End Function
+
+    ''' <summary>
+    ''' Sends file data in chunks with data opcode (0x02).
+    ''' Uses the SAME characteristic as metadata (opcode-multiplexed).
+    ''' Returns tuple with (BytesSent, ChunksSent) for display in success message.
+    ''' </summary>
+    Private Async Function SendFileDataInChunks(patternChar As GattCharacteristic, fileBytes As Byte(), Optional chunkSize As Integer = 20) As Task(Of (BytesSent As Integer, ChunksSent As Integer))
+        If chunkSize < 1 Then chunkSize = 20 ' Guard against an invalid MTU-derived size
+        Const dataOpcode As Byte = &H02 ' Data opcode
+
+        Dim totalChunks As Integer = Math.Ceiling(fileBytes.Length / chunkSize)
+        Dim bytesSent As Integer = 0
+
+        txtCharDetails.Text &= vbCrLf & vbCrLf & $"Sending file data (opcode 0x02) to pattern characteristic..." & vbCrLf &
+                              $"Total chunks: {totalChunks}"
+
+        For chunkIndex As Integer = 0 To totalChunks - 1
+            Dim offset As Integer = chunkIndex * chunkSize
+            Dim currentChunkSize As Integer = Math.Min(chunkSize, fileBytes.Length - offset)
+
+            ' Build packet: [opcode:0x02][file data...]
+            Dim packet(currentChunkSize) As Byte
+            packet(0) = dataOpcode
+            Array.Copy(fileBytes, offset, packet, 1, currentChunkSize)
+
+            Dim writeResult = Await SendDataToCharacteristic(patternChar, packet)
+
+            If writeResult <> GattCommunicationStatus.Success Then
+                MessageBox.Show($"Failed to send chunk {chunkIndex + 1}/{totalChunks}: {writeResult}", "Send Failed", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                txtCharDetails.Text &= vbCrLf & $"✗ Failed at chunk {chunkIndex + 1}/{totalChunks}: {writeResult}"
+                Return (bytesSent, chunkIndex)
+            End If
+
+            bytesSent += currentChunkSize
+            Await Task.Delay(10)
+
+            lblCharacteristicsTitle.Text = $"Sending... {bytesSent}/{fileBytes.Length} bytes ({chunkIndex + 1}/{totalChunks})"
+            Application.DoEvents()
+
+            ' Small delay between chunks to avoid overwhelming device
+            If (patternChar.CharacteristicProperties And GattCharacteristicProperties.Write) <> GattCharacteristicProperties.Write Then
+                Await Task.Delay(10) ' Delay for WriteWithoutResponse
+            End If
+        Next
+
+        Return (bytesSent, totalChunks)
     End Function
 
     Private Sub btnDisconnect_Click(sender As Object, e As EventArgs) Handles btnDisconnect.Click
