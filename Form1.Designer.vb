@@ -61,6 +61,7 @@ Partial Class Form1
         txtSearch.PlaceholderText = "Search devices..."
         txtSearch.Size = New Size(300, 23)
         txtSearch.TabIndex = 3
+        txtSearch.Text = "LightStrip"
         ' 
         ' Form1
         ' 

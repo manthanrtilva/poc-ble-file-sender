@@ -40,6 +40,7 @@ Partial Class DeviceServicesForm
         btnBrowseFile = New Button()
         lblFile = New Label()
         btnSendFile = New Button()
+        chkSetMtu = New CheckBox()
         SuspendLayout()
         '
         'lblDeviceName
@@ -212,11 +213,24 @@ Partial Class DeviceServicesForm
         btnSendFile.Text = "Send File"
         btnSendFile.UseVisualStyleBackColor = True
         '
+        'chkSetMtu
+        '
+        chkSetMtu.AutoSize = True
+        chkSetMtu.Checked = True
+        chkSetMtu.CheckState = CheckState.Checked
+        chkSetMtu.Location = New Point(470, 424)
+        chkSetMtu.Name = "chkSetMtu"
+        chkSetMtu.Size = New Size(104, 19)
+        chkSetMtu.TabIndex = 18
+        chkSetMtu.Text = "Negotiate MTU"
+        chkSetMtu.UseVisualStyleBackColor = True
+        '
         'DeviceServicesForm
         '
         AutoScaleDimensions = New SizeF(7.0F, 15.0F)
         AutoScaleMode = AutoScaleMode.Font
         ClientSize = New Size(804, 541)
+        Controls.Add(chkSetMtu)
         Controls.Add(btnSendFile)
         Controls.Add(lblFile)
         Controls.Add(btnBrowseFile)
@@ -259,5 +273,6 @@ Partial Class DeviceServicesForm
     Friend WithEvents btnBrowseFile As Button
     Friend WithEvents lblFile As Label
     Friend WithEvents btnSendFile As Button
+    Friend WithEvents chkSetMtu As CheckBox
 
 End Class

@@ -8,6 +8,14 @@ Public Class DeviceServicesForm
     Private gattSession As GattSession
     Private selectedFilePath As String = ""
 
+    ' Pattern status channel (11110005). The firmware notifies [opcode, status]
+    ' on this characteristic to accept/reject each pattern operation.
+    Private patternStatusChar As GattCharacteristic
+    Private patternStatusTcs As TaskCompletionSource(Of Byte())
+
+    ' Mirrors pattern_status_t in firmware app_flash_pattern.h.
+    Private Const PATTERN_STATUS_SUCCESS As Byte = 0
+
     Public Sub New(device As BluetoothLEDevice, gattServices As IReadOnlyList(Of GattDeviceService))
         InitializeComponent()
         currentDevice = device
@@ -398,8 +406,12 @@ Public Class DeviceServicesForm
             ' Also find CC characteristic for MTU negotiation
             Dim patternCharUuid As New Guid("11110004-1111-1111-1111-111111111111")
             Dim ccCharUuid As New Guid("11110003-1111-1111-1111-111111111111") ' CC characteristic for MTU
+            Dim patternStatusCharUuid As New Guid("11110005-1111-1111-1111-111111111111") ' Pattern status notifications
+            Dim completeCharUuid As New Guid("5a757275-2d50-6f70-636f-6e732d000001") ' Transfer-complete characteristic
             Dim patternChar As GattCharacteristic = Nothing
             Dim ccChar As GattCharacteristic = Nothing
+            Dim completeChar As GattCharacteristic = Nothing
+            patternStatusChar = Nothing ' reset; populated by the search below
 
             lblCharacteristicsTitle.Text = "Finding control characteristics..."
             Application.DoEvents()
@@ -414,10 +426,14 @@ Public Class DeviceServicesForm
                                 patternChar = ch
                             ElseIf ch.Uuid = ccCharUuid Then
                                 ccChar = ch
+                            ElseIf ch.Uuid = patternStatusCharUuid Then
+                                patternStatusChar = ch
+                            ElseIf ch.Uuid = completeCharUuid Then
+                                completeChar = ch
                             End If
                         Next
                     End If
-                    If patternChar IsNot Nothing Then Exit For
+                    If patternChar IsNot Nothing AndAlso completeChar IsNot Nothing AndAlso patternStatusChar IsNot Nothing Then Exit For
                 Catch ex As Exception
                     ' Continue searching
                 End Try
@@ -437,7 +453,9 @@ Public Class DeviceServicesForm
             Const FIRMWARE_MAX_VALUE_LEN As Integer = 247 ' max attribute write length the firmware accepts
             Const REQUESTED_MTU As Integer = FIRMWARE_MAX_VALUE_LEN + 3 ' + ATT write header
 
-            If ccChar IsNot Nothing Then
+            If Not chkSetMtu.Checked Then
+                txtCharDetails.Text &= vbCrLf & "MTU negotiation skipped (checkbox unchecked)"
+            ElseIf ccChar IsNot Nothing Then
                 ' Ask the firmware to start an ATT MTU exchange.
                 ' Command format: [0x02 = OTA_CMD_MTU_UPDATE][MSB of MTU][LSB of MTU]
                 txtCharDetails.Text &= vbCrLf & "Negotiating MTU with device..."
@@ -476,11 +494,30 @@ Public Class DeviceServicesForm
             Dim fileChunkSize As Integer = Math.Max(1, maxValueLen - 1) ' minus 1 for opcode byte
             txtCharDetails.Text &= vbCrLf & $"Negotiated MTU: {negotiatedMtu} → file chunk size: {fileChunkSize} bytes"
 
+            ' Subscribe to the pattern status channel (11110005) BEFORE sending
+            ' metadata. The firmware reports accept/reject (e.g. BAD_PARAM) here;
+            ' the GATT write status only confirms the BLE write was delivered, not
+            ' that the device accepted the contents. Without this we'd stream the
+            ' whole file into a device that already rejected the header.
+            Dim statusSubscribed As Boolean = False
+            If patternStatusChar IsNot Nothing Then
+                statusSubscribed = Await SubscribePatternStatusAsync(patternStatusChar)
+                txtCharDetails.Text &= vbCrLf & If(statusSubscribed,
+                    "Subscribed to pattern status notifications (11110005)",
+                    "⚠ Could not enable pattern status notifications (11110005)")
+            Else
+                txtCharDetails.Text &= vbCrLf & "⚠ Pattern status characteristic (11110005) not found"
+            End If
+
             ' Send metadata to pattern characteristic using helper function
             ' Opcode 0x01 is prepended by BuildMetadataPacket()
             lblCharacteristicsTitle.Text = "Sending file metadata..."
             txtCharDetails.Text &= vbCrLf & vbCrLf & "Sending metadata (opcode 0x01) to pattern characteristic..."
             Application.DoEvents()
+
+            ' Arm the status listener BEFORE the write so a fast notification
+            ' can't arrive before we start waiting for it.
+            patternStatusTcs = New TaskCompletionSource(Of Byte())()
 
             Dim metadataResult = Await SendDataToCharacteristic(patternChar, metadataBytes)
 
@@ -492,37 +529,43 @@ Public Class DeviceServicesForm
                 Return
             End If
 
-            txtCharDetails.Text &= vbCrLf & $"✓ Metadata sent: Size={fileSize}, CRC32=0x{crc32Value:X8}"
+            txtCharDetails.Text &= vbCrLf & $"✓ Metadata written: Size={fileSize}, CRC32=0x{crc32Value:X8}"
 
-            ' Try to read response from pattern characteristic if readable
-            If (patternChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
-                txtCharDetails.Text &= vbCrLf & "Reading metadata response..."
-                Application.DoEvents()
-
-                Try
-                    Await Task.Delay(50) ' Small delay for device to process
-                    Dim readResult = Await patternChar.ReadValueAsync(BluetoothCacheMode.Uncached)
-
-                    If readResult.Status = GattCommunicationStatus.Success Then
-                        Dim reader = Windows.Storage.Streams.DataReader.FromBuffer(readResult.Value)
-                        Dim responseBytes(reader.UnconsumedBufferLength - 1) As Byte
-                        reader.ReadBytes(responseBytes)
-
-                        txtCharDetails.Text &= vbCrLf & $"Metadata Response: {BitConverter.ToString(responseBytes).Replace("-", " ")}"
-
-                        ' Interpret response: [opcode, status]
-                        If responseBytes.Length >= 2 Then
-                            txtCharDetails.Text &= vbCrLf & $"Response Opcode: 0x{responseBytes(0):X2}, Status: 0x{responseBytes(1):X2}"
-                        End If
-                    Else
-                        txtCharDetails.Text &= vbCrLf & $"Could not read metadata response: {readResult.Status}"
-                    End If
-                Catch ex As Exception
-                    txtCharDetails.Text &= vbCrLf & $"Metadata response read error: {ex.Message}"
-                End Try
+            ' Gate the file transfer on the firmware's metadata status. Only stream
+            ' file data if the device explicitly accepted the header (SUCCESS).
+            If Not statusSubscribed Then
+                txtCharDetails.Text &= vbCrLf & "✗ Cannot confirm metadata acceptance (no status channel). Aborting — file data NOT sent."
+                MessageBox.Show("Cannot confirm the device accepted the metadata (status channel unavailable)." & vbCrLf & vbCrLf &
+                                "File transfer aborted — no file data was sent.",
+                                "Metadata Not Confirmed", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
             End If
 
-            Await Task.Delay(100) ' Give device time to process metadata
+            txtCharDetails.Text &= vbCrLf & "Waiting for metadata status from device..."
+            Application.DoEvents()
+
+            Dim metaStatusBytes As Byte() = Await WaitForPatternStatusAsync(5000)
+
+            If metaStatusBytes Is Nothing Then
+                txtCharDetails.Text &= vbCrLf & "✗ No metadata status received within 5s (timeout). Aborting — file data NOT sent."
+                MessageBox.Show("Device did not acknowledge the metadata (timeout)." & vbCrLf & vbCrLf &
+                                "File transfer aborted — no file data was sent.",
+                                "Metadata Not Acknowledged", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
+            End If
+
+            Dim metaStatusCode As Byte = If(metaStatusBytes.Length >= 2, metaStatusBytes(1), CByte(&HFF))
+            txtCharDetails.Text &= vbCrLf & $"Metadata status: {BitConverter.ToString(metaStatusBytes).Replace("-", " ")} → {PatternStatusName(metaStatusCode)}"
+
+            If metaStatusCode <> PATTERN_STATUS_SUCCESS Then
+                txtCharDetails.Text &= vbCrLf & $"✗ Firmware rejected metadata: {PatternStatusName(metaStatusCode)} (0x{metaStatusCode:X2}). File data NOT sent."
+                MessageBox.Show($"Device rejected the metadata: {PatternStatusName(metaStatusCode)} (0x{metaStatusCode:X2})." & vbCrLf & vbCrLf &
+                                "File transfer aborted — no file data was sent.",
+                                "Metadata Rejected", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Return
+            End If
+
+            txtCharDetails.Text &= vbCrLf & "✓ Device accepted metadata — proceeding to send file data."
 
             ' Confirm large file send
             If fileBytes.Length > 512 Then
@@ -546,8 +589,31 @@ Public Class DeviceServicesForm
             Dim totalBytesSent = result.BytesSent
             Dim totalChunks = result.ChunksSent
 
+            If totalBytesSent < fileBytes.Length Then
+                Return ' Chunk send failed; SendFileDataInChunks already reported the error
+            End If
+
             lblCharacteristicsTitle.Text = "File Sent Successfully!"
             txtCharDetails.Text &= vbCrLf & $"✓ Successfully sent {totalBytesSent} bytes in {totalChunks} chunks"
+
+            ' Signal transfer complete: write 0x0C to the complete characteristic (11110002)
+            If completeChar IsNot Nothing Then
+                txtCharDetails.Text &= vbCrLf & "Sending transfer-complete (0x0C) to 5a757275-2d50-6f70-636f-6e732d000001..."
+                Application.DoEvents()
+
+                Try
+                    Dim completeResult = Await SendDataToCharacteristic(completeChar, New Byte() {&HC})
+                    If completeResult = GattCommunicationStatus.Success Then
+                        txtCharDetails.Text &= vbCrLf & "✓ Transfer-complete (0x0C) sent"
+                    Else
+                        txtCharDetails.Text &= vbCrLf & $"✗ Transfer-complete write failed: {completeResult}"
+                    End If
+                Catch ex As Exception
+                    txtCharDetails.Text &= vbCrLf & $"✗ Transfer-complete write error: {ex.Message}"
+                End Try
+            Else
+                txtCharDetails.Text &= vbCrLf & "⚠ Complete characteristic 5a757275-...-000001 not found - skipped 0x0C write"
+            End If
 
             ' Try to read final response from pattern characteristic
             If (patternChar.CharacteristicProperties And GattCharacteristicProperties.Read) = GattCharacteristicProperties.Read Then
@@ -582,6 +648,14 @@ Public Class DeviceServicesForm
             txtCharDetails.Text &= vbCrLf & $"✗ Error: {ex.Message}"
             MessageBox.Show($"Error sending file: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
         Finally
+            ' Stop listening for status notifications and clear any pending waiter.
+            If patternStatusChar IsNot Nothing Then
+                Try
+                    RemoveHandler patternStatusChar.ValueChanged, AddressOf OnPatternStatusChanged
+                Catch
+                End Try
+            End If
+            patternStatusTcs = Nothing
             btnSendFile.Enabled = True
             btnBrowseFile.Enabled = True
             lblCharacteristicsTitle.Text = $"Characteristics ({characteristicsList.Count})"
@@ -639,6 +713,74 @@ Public Class DeviceServicesForm
 
         Return crc32
     End Function
+
+    ''' <summary>
+    ''' Maps a firmware pattern_status_t code to a readable name
+    ''' (mirrors the enum in firmware app_flash_pattern.h).
+    ''' </summary>
+    Private Function PatternStatusName(status As Byte) As String
+        Select Case status
+            Case 0 : Return "SUCCESS"
+            Case 1 : Return "IN_PROGRESS"
+            Case 2 : Return "NOT_INITIALIZED"
+            Case 3 : Return "SIZE_MISMATCH"
+            Case 4 : Return "FLASH_WRITE_FAIL"
+            Case 5 : Return "CRC_MISMATCH"
+            Case 6 : Return "BAD_PARAM"
+            Case 7 : Return "INVALID_FORMAT"
+            Case Else : Return $"UNKNOWN(0x{status:X2})"
+        End Select
+    End Function
+
+    ''' <summary>
+    ''' Enables notifications on the pattern status characteristic (11110005) and
+    ''' attaches the handler that captures [opcode, status] frames from the device.
+    ''' Returns True only if the device accepted the notification subscription.
+    ''' </summary>
+    Private Async Function SubscribePatternStatusAsync(statusChar As GattCharacteristic) As Task(Of Boolean)
+        Try
+            RemoveHandler statusChar.ValueChanged, AddressOf OnPatternStatusChanged ' avoid double-subscribe
+        Catch
+        End Try
+        Try
+            AddHandler statusChar.ValueChanged, AddressOf OnPatternStatusChanged
+            Dim status = Await statusChar.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue.Notify)
+            Return status = GattCommunicationStatus.Success
+        Catch ex As Exception
+            Return False
+        End Try
+    End Function
+
+    ''' <summary>
+    ''' Handles status notifications from the firmware. Each frame is [opcode, status];
+    ''' completes any pending wait so the send flow can react on the UI thread.
+    ''' </summary>
+    Private Sub OnPatternStatusChanged(sender As GattCharacteristic, args As GattValueChangedEventArgs)
+        Try
+            Dim reader = Windows.Storage.Streams.DataReader.FromBuffer(args.CharacteristicValue)
+            Dim data(reader.UnconsumedBufferLength - 1) As Byte
+            reader.ReadBytes(data)
+            patternStatusTcs?.TrySetResult(data)
+        Catch
+            ' Ignore malformed notifications
+        End Try
+    End Sub
+
+    ''' <summary>
+    ''' Waits for the next pattern status notification, or returns Nothing on timeout.
+    ''' Arm patternStatusTcs before the triggering write so no notification is missed.
+    ''' </summary>
+    Private Async Function WaitForPatternStatusAsync(timeoutMs As Integer) As Task(Of Byte())
+        Dim tcs = patternStatusTcs
+        If tcs Is Nothing Then Return Nothing
+        Dim finished = Await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs))
+        If finished Is tcs.Task Then
+            Return tcs.Task.Result
+        End If
+        Return Nothing ' timeout
+    End Function
+
     Private Function GetCharacteristicName(uuid As Guid) As String
         Dim knownCharacteristics As New Dictionary(Of String, String) From {
             {"00002a00-0000-1000-8000-00805f9b34fb", "Device Name"},
@@ -694,26 +836,28 @@ Public Class DeviceServicesForm
 
     ''' <summary>
     ''' Builds a metadata packet with file size and CRC32 checksum.
-    ''' Current format: [opcode:1 byte = 0x01][size:4 bytes LE][crc32:4 bytes LE]
-    ''' Total: 9 bytes
-    ''' 
+    ''' Format: [opcode:1 byte = 0x01][size:4 bytes BE][crc32:4 bytes BE]
+    ''' Total: 9 bytes. Big-endian (MSB first) to match the firmware, which
+    ''' parses size = value[1]&lt;&lt;24 | value[2]&lt;&lt;16 | value[3]&lt;&lt;8 | value[4]
+    ''' (see app_ns_ius.c PATTERN_OP_META handler).
+    '''
     ''' MODIFY THIS FUNCTION IF FIRMWARE CHANGES THE METADATA FORMAT
     ''' </summary>
     Private Function BuildMetadataPacket(fileSize As UInteger, crc32Value As UInteger) As Byte()
         Dim metadataBytes(8) As Byte ' 9 bytes total
         metadataBytes(0) = &H1 ' Opcode for metadata
 
-        ' File size in little-endian (4 bytes)
-        metadataBytes(1) = CByte((fileSize >> 0) And &HFF)
-        metadataBytes(2) = CByte((fileSize >> 8) And &HFF)
-        metadataBytes(3) = CByte((fileSize >> 16) And &HFF)
-        metadataBytes(4) = CByte((fileSize >> 24) And &HFF)
+        ' File size in big-endian (4 bytes) — MSB first (firmware reads value[1]<<24)
+        metadataBytes(1) = CByte((fileSize >> 24) And &HFF)
+        metadataBytes(2) = CByte((fileSize >> 16) And &HFF)
+        metadataBytes(3) = CByte((fileSize >> 8) And &HFF)
+        metadataBytes(4) = CByte((fileSize >> 0) And &HFF)
 
-        ' CRC32 in little-endian (4 bytes)
-        metadataBytes(5) = CByte((crc32Value >> 0) And &HFF)
-        metadataBytes(6) = CByte((crc32Value >> 8) And &HFF)
-        metadataBytes(7) = CByte((crc32Value >> 16) And &HFF)
-        metadataBytes(8) = CByte((crc32Value >> 24) And &HFF)
+        ' CRC32 in big-endian (4 bytes) — MSB first (firmware reads value[5]<<24)
+        metadataBytes(5) = CByte((crc32Value >> 24) And &HFF)
+        metadataBytes(6) = CByte((crc32Value >> 16) And &HFF)
+        metadataBytes(7) = CByte((crc32Value >> 8) And &HFF)
+        metadataBytes(8) = CByte((crc32Value >> 0) And &HFF)
 
         Return metadataBytes
     End Function
